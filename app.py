@@ -12,7 +12,8 @@ from aiogram.types import (
     Message,
     InlineKeyboardMarkup,
     InlineKeyboardButton,
-    CallbackQuery
+    CallbackQuery,
+    FSInputFile
 )
 from aiogram.filters import Command
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
@@ -24,7 +25,7 @@ logging.basicConfig(level=logging.INFO)
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-queue = asyncio.Semaphore(3)
+queue = asyncio.Semaphore(2)
 
 # ---------------- DATABASE ----------------
 
@@ -46,7 +47,6 @@ async def init_db():
         """)
         await db.commit()
 
-
 async def add_user(user_id):
     async with aiosqlite.connect(DB_NAME) as db:
         await db.execute("""
@@ -54,14 +54,6 @@ async def add_user(user_id):
         VALUES (?, datetime('now'))
         """, (user_id,))
         await db.commit()
-
-
-async def get_total_users():
-    async with aiosqlite.connect(DB_NAME) as db:
-        cursor = await db.execute("SELECT COUNT(*) FROM users")
-        row = await cursor.fetchone()
-        return row[0]
-
 
 async def get_downloads_today(user_id):
     today = str(date.today())
@@ -72,7 +64,6 @@ async def get_downloads_today(user_id):
         )
         row = await cursor.fetchone()
         return row[0] if row else 0
-
 
 async def increment_download(user_id):
     today = str(date.today())
@@ -85,16 +76,7 @@ async def increment_download(user_id):
         """, (user_id, today))
         await db.commit()
 
-# ---------------- SUBSCRIPTION CHECK ----------------
-
-async def check_subscription(user_id):
-    if not REQUIRED_CHANNEL:
-        return True
-
-    member = await bot.get_chat_member(REQUIRED_CHANNEL, user_id)
-    return member.status in ["member", "administrator", "creator"]
-
-# ---------------- DOWNLOADER ----------------
+# ---------------- DOWNLOAD ----------------
 
 def run_yt_dlp(url, audio_only=False):
     filename = str(uuid.uuid4())
@@ -120,69 +102,35 @@ def run_yt_dlp(url, audio_only=False):
 
     return None
 
-# ---------------- HANDLERS ----------------
+# ---------------- START ----------------
 
 @dp.message(Command("start"))
 async def start(message: Message):
     await add_user(message.from_user.id)
 
-    text = """
-🎬 Downloader Bot
+    text = f"""
+🎬 <b>Hoard Video Bot</b>
 
-Поддержка:
-YouTube | TikTok | Instagram | Pinterest
+━━━━━━━━━━━━━━━━━━
 
-Отправь ссылку 👇
+📥 Скачиваю видео из:
+
+▸ YouTube  
+▸ TikTok  
+▸ Instagram  
+▸ Pinterest  
+▸ Facebook  
+▸ Twitter  
+
+━━━━━━━━━━━━━━━━━━
+
+📎 Просто отправь ссылку  
+И я пришлю файл в один миг ⚡
 """
-    await message.answer(text)
 
+    await message.answer(text, parse_mode="HTML")
 
-@dp.message(Command("admin"))
-async def admin_panel(message: Message):
-    if message.from_user.id != ADMIN_ID:
-        return
-
-    total = await get_total_users()
-
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📊 Статистика", callback_data="stats")],
-        [InlineKeyboardButton(text="📢 Рассылка", callback_data="broadcast")]
-    ])
-
-    await message.answer(f"👑 Админ панель\n\n👥 Пользователей: {total}", reply_markup=keyboard)
-
-
-@dp.callback_query()
-async def admin_callbacks(callback: CallbackQuery):
-
-    if callback.data == "stats":
-        total = await get_total_users()
-        await callback.message.answer(f"📊 Всего пользователей: {total}")
-
-    if callback.data == "broadcast":
-        await callback.message.answer("Отправь сообщение для рассылки")
-        dp.message.register(broadcast_message)
-
-
-async def broadcast_message(message: Message):
-    if message.from_user.id != ADMIN_ID:
-        return
-
-    async with aiosqlite.connect(DB_NAME) as db:
-        cursor = await db.execute("SELECT telegram_id FROM users")
-        users = await cursor.fetchall()
-
-    sent = 0
-    for user in users:
-        try:
-            await bot.send_message(user[0], message.text)
-            sent += 1
-        except:
-            pass
-
-    await message.answer(f"✅ Отправлено: {sent}")
-
-# ---------------- DOWNLOAD HANDLER ----------------
+# ---------------- LINK HANDLER ----------------
 
 @dp.message(F.text)
 async def handle_link(message: Message):
@@ -191,17 +139,10 @@ async def handle_link(message: Message):
     if not url.startswith("http"):
         return
 
-    if not await check_subscription(message.from_user.id):
-        keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="Подписаться", url=f"https://t.me/{REQUIRED_CHANNEL.replace('@','')}")]
-        ])
-        await message.answer("Подпишись на канал для использования бота", reply_markup=keyboard)
-        return
-
     downloads = await get_downloads_today(message.from_user.id)
 
     if downloads >= DAILY_LIMIT:
-        await message.answer("⚠ Лимит на сегодня исчерпан")
+        await message.answer("⚠️ Лимит на сегодня исчерпан")
         return
 
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
@@ -213,25 +154,43 @@ async def handle_link(message: Message):
 
     await message.answer("Выбери формат:", reply_markup=keyboard)
 
+# ---------------- CALLBACK ----------------
 
 @dp.callback_query(F.data.contains("|"))
 async def process_download(callback: CallbackQuery):
     mode, url = callback.data.split("|")
 
-    await callback.message.edit_text("⏳ Скачиваю...")
+    await callback.answer("⏳ Обработка...")
+
+    waiting = await callback.message.answer("⏳ Загружаю файл...")
 
     async with queue:
         file_path = run_yt_dlp(url, audio_only=(mode == "audio"))
 
     if not file_path:
-        await callback.message.answer("❌ Ошибка загрузки")
+        await waiting.edit_text("❌ Ошибка загрузки")
         return
 
     try:
-        await callback.message.answer_document(open(file_path, "rb"))
+        file = FSInputFile(file_path)
+
+        if mode == "video":
+            await callback.message.answer_video(
+                file,
+                caption="🎉 Скачано с помощью\n@HoardVideoBot"
+            )
+        else:
+            await callback.message.answer_audio(
+                file,
+                caption="🎉 Скачано с помощью\n@HoardVideoBot"
+            )
+
         await increment_download(callback.from_user.id)
+        await waiting.delete()
+
     finally:
-        os.remove(file_path)
+        if os.path.exists(file_path):
+            os.remove(file_path)
 
 # ---------------- WEBHOOK ----------------
 
