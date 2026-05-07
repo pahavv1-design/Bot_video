@@ -6,7 +6,6 @@ import subprocess
 from datetime import date
 
 import aiosqlite
-from aiohttp import web
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import (
     Message,
@@ -16,7 +15,6 @@ from aiogram.types import (
     FSInputFile
 )
 from aiogram.filters import Command
-from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 
 from config import *
 
@@ -194,37 +192,14 @@ async def process_download(callback: CallbackQuery):
             os.remove(file_path)
 
 
-# ================= WEBHOOK =================
+# ================= MAIN =================
 
-async def on_startup(app):
+async def main():
     await init_db()
     os.makedirs(DOWNLOAD_PATH, exist_ok=True)
-
-    await bot.delete_webhook(drop_pending_updates=True)
-    await bot.set_webhook(WEBHOOK_URL)
-
-    print("Webhook set to:", WEBHOOK_URL)
-
-
-async def on_shutdown(app):
-    await bot.delete_webhook()
-
-
-def main():
-    app = web.Application()
-
-    app.on_startup.append(on_startup)
-    app.on_shutdown.append(on_shutdown)
-
-    SimpleRequestHandler(
-        dispatcher=dp,
-        bot=bot
-    ).register(app, path="/")
-
-    setup_application(app, dp, bot=bot)
-
-    web.run_app(app, host="0.0.0.0", port=PORT)
+    print("Bot started (Polling mode)")
+    await dp.start_polling(bot)
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
