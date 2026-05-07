@@ -27,7 +27,7 @@ dp = Dispatcher()
 
 queue = asyncio.Semaphore(2)
 
-# ---------------- DATABASE ----------------
+# ================= DATABASE =================
 
 async def init_db():
     async with aiosqlite.connect(DB_NAME) as db:
@@ -47,6 +47,7 @@ async def init_db():
         """)
         await db.commit()
 
+
 async def add_user(user_id):
     async with aiosqlite.connect(DB_NAME) as db:
         await db.execute("""
@@ -54,6 +55,7 @@ async def add_user(user_id):
         VALUES (?, datetime('now'))
         """, (user_id,))
         await db.commit()
+
 
 async def get_downloads_today(user_id):
     today = str(date.today())
@@ -64,6 +66,7 @@ async def get_downloads_today(user_id):
         )
         row = await cursor.fetchone()
         return row[0] if row else 0
+
 
 async def increment_download(user_id):
     today = str(date.today())
@@ -76,7 +79,8 @@ async def increment_download(user_id):
         """, (user_id, today))
         await db.commit()
 
-# ---------------- DOWNLOAD ----------------
+
+# ================= DOWNLOAD =================
 
 def run_yt_dlp(url, audio_only=False):
     filename = str(uuid.uuid4())
@@ -102,13 +106,14 @@ def run_yt_dlp(url, audio_only=False):
 
     return None
 
-# ---------------- START ----------------
+
+# ================= HANDLERS =================
 
 @dp.message(Command("start"))
 async def start(message: Message):
     await add_user(message.from_user.id)
 
-    text = f"""
+    text = """
 🎬 <b>Hoard Video Bot</b>
 
 ━━━━━━━━━━━━━━━━━━
@@ -130,7 +135,6 @@ async def start(message: Message):
 
     await message.answer(text, parse_mode="HTML")
 
-# ---------------- LINK HANDLER ----------------
 
 @dp.message(F.text)
 async def handle_link(message: Message):
@@ -154,7 +158,6 @@ async def handle_link(message: Message):
 
     await message.answer("Выбери формат:", reply_markup=keyboard)
 
-# ---------------- CALLBACK ----------------
 
 @dp.callback_query(F.data.contains("|"))
 async def process_download(callback: CallbackQuery):
@@ -192,25 +195,43 @@ async def process_download(callback: CallbackQuery):
         if os.path.exists(file_path):
             os.remove(file_path)
 
-# ---------------- WEBHOOK ----------------
+
+# ================= WEBHOOK =================
+
+WEBHOOK_PATH = "/webhook"
+
 
 async def on_startup(app):
     await init_db()
     os.makedirs(DOWNLOAD_PATH, exist_ok=True)
-    await bot.set_webhook(WEBHOOK_URL + WEBHOOK_PATH)
+
+    webhook_url = WEBHOOK_URL + WEBHOOK_PATH
+
+    await bot.delete_webhook(drop_pending_updates=True)
+    await bot.set_webhook(webhook_url)
+
+    print("Webhook set to:", webhook_url)
+
 
 async def on_shutdown(app):
     await bot.delete_webhook()
 
+
 def main():
     app = web.Application()
+
     app.on_startup.append(on_startup)
     app.on_shutdown.append(on_shutdown)
 
-    SimpleRequestHandler(dispatcher=dp, bot=bot).register(app, path=WEBHOOK_PATH)
+    SimpleRequestHandler(
+        dispatcher=dp,
+        bot=bot
+    ).register(app, path=WEBHOOK_PATH)
+
     setup_application(app, dp, bot=bot)
 
     web.run_app(app, host="0.0.0.0", port=PORT)
+
 
 if __name__ == "__main__":
     main()
