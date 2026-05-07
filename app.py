@@ -197,7 +197,7 @@ async def process_download(callback: CallbackQuery):
 async def on_startup(app):
     await init_db()
     os.makedirs(DOWNLOAD_PATH, exist_ok=True)
-    await bot.set_webhook(WEBHOOK_URL)
+    await bot.set_webhook(WEBHOOK_URL + WEBHOOK_PATH)
 
 async def on_shutdown(app):
     await bot.delete_webhook()
@@ -207,7 +207,7 @@ def main():
     app.on_startup.append(on_startup)
     app.on_shutdown.append(on_shutdown)
 
-    SimpleRequestHandler(dispatcher=dp, bot=bot).register(app, path="/")
+    SimpleRequestHandler(dispatcher=dp, bot=bot).register(app, path=WEBHOOK_PATH)
     setup_application(app, dp, bot=bot)
 
     web.run_app(app, host="0.0.0.0", port=PORT)
