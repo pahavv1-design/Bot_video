@@ -16,3 +16,5 @@ REQUIRED_CHANNEL = os.getenv("REQUIRED_CHANNEL")  # @channel_username
 
 DOWNLOAD_PATH = "downloads"
 DB_NAME = "users.db"
+
+WEBHOOK_PATH = "/webhook"
