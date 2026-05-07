@@ -124,13 +124,11 @@ async def start(message: Message):
 ▸ TikTok  
 ▸ Instagram  
 ▸ Pinterest  
-▸ Facebook  
-▸ Twitter  
 
 ━━━━━━━━━━━━━━━━━━
 
 📎 Просто отправь ссылку  
-И я пришлю файл в один миг ⚡
+И я пришлю файл ⚡
 """
 
     await message.answer(text, parse_mode="HTML")
@@ -198,19 +196,14 @@ async def process_download(callback: CallbackQuery):
 
 # ================= WEBHOOK =================
 
-WEBHOOK_PATH = "/webhook"
-
-
 async def on_startup(app):
     await init_db()
     os.makedirs(DOWNLOAD_PATH, exist_ok=True)
 
-    webhook_url = WEBHOOK_URL + WEBHOOK_PATH
-
     await bot.delete_webhook(drop_pending_updates=True)
-    await bot.set_webhook(webhook_url)
+    await bot.set_webhook(WEBHOOK_URL)
 
-    print("Webhook set to:", webhook_url)
+    print("Webhook set to:", WEBHOOK_URL)
 
 
 async def on_shutdown(app):
@@ -226,7 +219,7 @@ def main():
     SimpleRequestHandler(
         dispatcher=dp,
         bot=bot
-    ).register(app, path=WEBHOOK_PATH)
+    ).register(app, path="/")
 
     setup_application(app, dp, bot=bot)
 
