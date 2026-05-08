@@ -85,25 +85,27 @@ async def increment_download(user_id):
         """, (user_id, today))
         await db.commit()
 
+
 # ================= DOWNLOAD =================
 
 def run_yt_dlp(url, audio_only=False):
     filename = str(uuid.uuid4())
     output = os.path.join(DOWNLOAD_PATH, filename)
 
-    command = [
-        "yt-dlp",
-        "-f", "mp4",
-        "--no-playlist",
-        "-o", f"{output}.%(ext)s",
-        url
-    ]
-
     if audio_only:
         command = [
             "yt-dlp",
             "-x",
             "--audio-format", "mp3",
+            "--no-playlist",
+            "-o", f"{output}.%(ext)s",
+            url
+        ]
+    else:
+        command = [
+            "yt-dlp",
+            "-f", "mp4",
+            "--no-playlist",
             "-o", f"{output}.%(ext)s",
             url
         ]
@@ -188,35 +190,30 @@ async def start_broadcast(callback: CallbackQuery):
     await callback.message.answer("Отправь сообщение для рассылки")
 
 
-@dp.message()
-async def handle_broadcast(message: Message):
-    if message.from_user.id != ADMIN_ID:
-        return
-
-    if not broadcast_mode.get(ADMIN_ID):
-        return
-
-    broadcast_mode[ADMIN_ID] = False
-
-    async with aiosqlite.connect(DB_NAME) as db:
-        cur = await db.execute("SELECT telegram_id FROM users")
-        users = await cur.fetchall()
-
-    sent = 0
-    for user in users:
-        try:
-            await bot.send_message(user[0], message.text)
-            sent += 1
-        except:
-            pass
-
-    await message.answer(f"✅ Отправлено: {sent}")
-
-
-# ================= DOWNLOAD =================
-
 @dp.message(F.text)
-async def handle_link(message: Message):
+async def handle_messages(message: Message):
+
+    # ===== РАССЫЛКА =====
+    if message.from_user.id == ADMIN_ID and broadcast_mode.get(ADMIN_ID):
+        broadcast_mode[ADMIN_ID] = False
+
+        async with aiosqlite.connect(DB_NAME) as db:
+            cur = await db.execute("SELECT telegram_id FROM users")
+            users = await cur.fetchall()
+
+        sent = 0
+        for user in users:
+            try:
+                await bot.send_message(user[0], message.text)
+                sent += 1
+            except:
+                pass
+
+        await message.answer(f"✅ Отправлено: {sent}")
+        return
+
+    # ===== ОБРАБОТКА ССЫЛКИ =====
+
     url = message.text.strip()
 
     if not url.startswith("http"):
@@ -238,6 +235,8 @@ async def handle_link(message: Message):
     await message.answer("Выбери формат:", reply_markup=keyboard)
 
 
+# ================= CALLBACK =================
+
 @dp.callback_query(F.data.contains("|"))
 async def process_download(callback: CallbackQuery):
     mode, url = callback.data.split("|")
@@ -246,6 +245,7 @@ async def process_download(callback: CallbackQuery):
 
     waiting = await callback.message.answer("⏳ Загружаю...")
 
+    # Админ без очереди
     if callback.from_user.id == ADMIN_ID:
         file_path = run_yt_dlp(url, audio_only=(mode == "audio"))
     else:
@@ -259,8 +259,7 @@ async def process_download(callback: CallbackQuery):
     size_mb = os.path.getsize(file_path) / (1024 * 1024)
 
     if size_mb > MAX_FILESIZE_MB and mode == "video":
-        compressed = compress_video(file_path)
-        file_path = compressed
+        file_path = compress_video(file_path)
 
     try:
         file = FSInputFile(file_path)
@@ -289,7 +288,7 @@ async def process_download(callback: CallbackQuery):
 async def main():
     await init_db()
     os.makedirs(DOWNLOAD_PATH, exist_ok=True)
-    print("Bot started (2.0)")
+    print("Bot 2.1 started")
     await dp.start_polling(bot)
 
 
