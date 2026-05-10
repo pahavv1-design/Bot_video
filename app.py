@@ -3,7 +3,6 @@ import logging
 import os
 import uuid
 import subprocess
-import hashlib
 from datetime import date
 
 import aiosqlite
@@ -24,10 +23,9 @@ logging.basicConfig(level=logging.INFO)
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-queue = asyncio.Semaphore(3)  # увеличили очередь
+queue = asyncio.Semaphore(3)
 broadcast_mode = {}
-
-CACHE_DB = "cache.db"
+user_links = {}
 
 # ================= DATABASE =================
 
@@ -45,15 +43,6 @@ async def init_db():
             date TEXT,
             count INTEGER DEFAULT 0,
             PRIMARY KEY (telegram_id, date)
-        )
-        """)
-        await db.commit()
-
-    async with aiosqlite.connect(CACHE_DB) as db:
-        await db.execute("""
-        CREATE TABLE IF NOT EXISTS cache (
-            url TEXT PRIMARY KEY,
-            file_path TEXT
         )
         """)
         await db.commit()
@@ -90,31 +79,21 @@ async def increment_download(user_id):
         """, (user_id, today))
         await db.commit()
 
+# ================= SUBSCRIPTION =================
 
-# ================= CACHE =================
-
-async def get_cached(url):
-    async with aiosqlite.connect(CACHE_DB) as db:
-        cur = await db.execute("SELECT file_path FROM cache WHERE url=?", (url,))
-        row = await cur.fetchone()
-        if row and os.path.exists(row[0]):
-            return row[0]
-        return None
-
-
-async def save_cache(url, file_path):
-    async with aiosqlite.connect(CACHE_DB) as db:
-        await db.execute(
-            "INSERT OR REPLACE INTO cache (url, file_path) VALUES (?, ?)",
-            (url, file_path)
-        )
-        await db.commit()
-
+async def check_subscription(user_id):
+    if not REQUIRED_CHANNEL:
+        return True
+    try:
+        member = await bot.get_chat_member(REQUIRED_CHANNEL, user_id)
+        return member.status in ["member", "administrator", "creator"]
+    except:
+        return False
 
 # ================= DOWNLOAD =================
 
 def run_yt_dlp(url, audio_only=False):
-    filename = hashlib.md5(url.encode()).hexdigest()
+    filename = str(uuid.uuid4())
     output = os.path.join(DOWNLOAD_PATH, filename)
 
     if audio_only:
@@ -124,8 +103,6 @@ def run_yt_dlp(url, audio_only=False):
             "--audio-format", "mp3",
             "--no-playlist",
             "--concurrent-fragments", "5",
-            "--downloader", "aria2c",
-            "--downloader-args", "aria2c:-x 8 -k 1M",
             "-o", f"{output}.%(ext)s",
             url
         ]
@@ -136,8 +113,6 @@ def run_yt_dlp(url, audio_only=False):
             "--merge-output-format", "mp4",
             "--no-playlist",
             "--concurrent-fragments", "5",
-            "--downloader", "aria2c",
-            "--downloader-args", "aria2c:-x 8 -k 1M",
             "-o", f"{output}.%(ext)s",
             url
         ]
@@ -150,20 +125,6 @@ def run_yt_dlp(url, audio_only=False):
 
     return None
 
-
-# ================= SUBSCRIPTION =================
-
-async def check_subscription(user_id):
-    if not REQUIRED_CHANNEL:
-        return True
-
-    try:
-        member = await bot.get_chat_member(REQUIRED_CHANNEL, user_id)
-        return member.status in ["member", "administrator", "creator"]
-    except:
-        return False
-
-
 # ================= START =================
 
 @dp.message(Command("start"))
@@ -175,27 +136,31 @@ async def start(message: Message):
             [InlineKeyboardButton(text="📢 Подписаться", url=f"https://t.me/{REQUIRED_CHANNEL.replace('@','')}")],
             [InlineKeyboardButton(text="✅ Я подписался", callback_data="check_sub")]
         ])
-
-        await message.answer(
-            "Для использования бота подпишитесь на канал 👇",
-            reply_markup=keyboard
-        )
+        await message.answer("Подпишитесь на канал 👇", reply_markup=keyboard)
         return
 
     await message.answer(
         "🎬 <b>Hoard Video Bot</b>\n\n"
-        "Просто отправь ссылку 🔥",
+        "Поддержка:\n"
+        "YouTube Shorts\nTikTok\nInstagram\nVK\nTwitter/X\nPinterest\n\n"
+        "Отправь ссылку 🔥",
         parse_mode="HTML"
     )
-
 
 @dp.callback_query(F.data == "check_sub")
 async def check_sub_callback(callback: CallbackQuery):
     if await check_subscription(callback.from_user.id):
         await callback.message.edit_text("✅ Подписка подтверждена. Отправь ссылку.")
     else:
-        await callback.answer("❌ Вы ещё не подписаны.", show_alert=True)
+        await callback.answer("❌ Вы не подписаны.", show_alert=True)
 
+# ================= ADMIN =================
+
+@dp.message(Command("admin"))
+async def admin_panel(message: Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    await message.answer("👑 Админ панель работает ✅")
 
 # ================= MESSAGE =================
 
@@ -213,46 +178,43 @@ async def handle_message(message: Message):
     downloads = await get_downloads_today(message.from_user.id)
 
     if downloads >= DAILY_LIMIT and message.from_user.id != ADMIN_ID:
-        await message.answer("⚠️ Лимит на сегодня исчерпан")
+        await message.answer("⚠️ Лимит исчерпан")
         return
+
+    # сохраняем ссылку в память
+    user_links[message.from_user.id] = url
 
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text="🎥 Видео", callback_data=f"video|{url}"),
-            InlineKeyboardButton(text="🎵 MP3", callback_data=f"audio|{url}")
+            InlineKeyboardButton(text="🎥 Видео", callback_data="video"),
+            InlineKeyboardButton(text="🎵 MP3", callback_data="audio")
         ]
     ])
 
     await message.answer("Выбери формат:", reply_markup=keyboard)
 
-
 # ================= CALLBACK =================
 
-@dp.callback_query(F.data.contains("|"))
+@dp.callback_query(F.data.in_(["video", "audio"]))
 async def process_download(callback: CallbackQuery):
-    mode, url = callback.data.split("|")
+
+    url = user_links.get(callback.from_user.id)
+
+    if not url:
+        await callback.answer("Ошибка ссылки")
+        return
+
+    mode = callback.data
 
     await callback.answer("⏳ Обработка...")
-
     waiting = await callback.message.answer("⏳ Загружаю...")
 
-    # 🔥 КЭШ
-    cached = await get_cached(url)
+    async with queue:
+        file_path = run_yt_dlp(url, audio_only=(mode == "audio"))
 
-    if cached:
-        file_path = cached
-    else:
-        if callback.from_user.id == ADMIN_ID:
-            file_path = run_yt_dlp(url, audio_only=(mode == "audio"))
-        else:
-            async with queue:
-                file_path = run_yt_dlp(url, audio_only=(mode == "audio"))
-
-        if not file_path:
-            await waiting.edit_text("❌ Ошибка загрузки")
-            return
-
-        await save_cache(url, file_path)
+    if not file_path:
+        await waiting.edit_text("❌ Ошибка загрузки")
+        return
 
     try:
         file = FSInputFile(file_path)
@@ -271,18 +233,17 @@ async def process_download(callback: CallbackQuery):
         await increment_download(callback.from_user.id)
         await waiting.delete()
 
-    except:
-        await waiting.edit_text("❌ Ошибка отправки")
-
+    finally:
+        if os.path.exists(file_path):
+            os.remove(file_path)
 
 # ================= MAIN =================
 
 async def main():
     await init_db()
     os.makedirs(DOWNLOAD_PATH, exist_ok=True)
-    print("Bot 2.4 started (with cache + speed)")
+    print("Bot fixed version started")
     await dp.start_polling(bot)
-
 
 if __name__ == "__main__":
     asyncio.run(main())
