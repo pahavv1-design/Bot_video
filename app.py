@@ -4,17 +4,12 @@ import os
 import subprocess
 import hashlib
 import time
+import re
 from datetime import date
 
 import aiosqlite
 from aiogram import Bot, Dispatcher, F
-from aiogram.types import (
-    Message,
-    InlineKeyboardMarkup,
-    InlineKeyboardButton,
-    CallbackQuery,
-    FSInputFile
-)
+from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, FSInputFile
 from aiogram.filters import Command
 
 from config import *
@@ -28,7 +23,6 @@ queue = asyncio.Semaphore(3)
 
 DB_MAIN = "main.db"
 DB_LOG = "logs.db"
-SETTINGS = "settings.db"
 
 MAX_SIZE_MB = 60
 RATE_LIMIT = 3
@@ -36,7 +30,6 @@ RATE_WINDOW = 30
 
 user_requests = {}
 temp_ban = {}
-broadcast_mode = {}
 
 # ================= INIT =================
 
@@ -57,28 +50,6 @@ async def init_db():
             created_at TEXT
         )
         """)
-        await db.commit()
-
-    async with aiosqlite.connect(SETTINGS) as db:
-        await db.execute("""
-        CREATE TABLE IF NOT EXISTS settings (
-            key TEXT PRIMARY KEY,
-            value TEXT
-        )
-        """)
-        await db.commit()
-
-# ================= SETTINGS =================
-
-async def get_setting(key, default=None):
-    async with aiosqlite.connect(SETTINGS) as db:
-        cur = await db.execute("SELECT value FROM settings WHERE key=?", (key,))
-        row = await cur.fetchone()
-        return row[0] if row else default
-
-async def set_setting(key, value):
-    async with aiosqlite.connect(SETTINGS) as db:
-        await db.execute("INSERT OR REPLACE INTO settings VALUES (?, ?)", (key, value))
         await db.commit()
 
 # ================= USERS =================
@@ -137,7 +108,7 @@ def check_rate(user_id):
 
 def detect_platform(url):
     u = url.lower()
-    if "youtube" in u or "youtu.be" in u:
+    if "youtube" in u:
         return "YouTube"
     if "tiktok" in u:
         return "TikTok"
@@ -150,6 +121,20 @@ def detect_platform(url):
     if "pinterest" in u:
         return "Pinterest"
     return "Other"
+
+# ================= YOUTUBE NORMALIZATION =================
+
+def normalize_youtube(url):
+    # Убираем параметры
+    url = url.split("?")[0]
+
+    # Shorts → watch
+    match = re.search(r"/shorts/([a-zA-Z0-9_-]+)", url)
+    if match:
+        video_id = match.group(1)
+        return f"https://www.youtube.com/watch?v={video_id}"
+
+    return url
 
 # ================= DOWNLOAD =================
 
@@ -181,7 +166,27 @@ def run_yt_dlp(url):
 @dp.message(Command("start"))
 async def start(message: Message):
     await add_user(message.from_user.id)
-    await message.answer("🎬 HoardVideoBot\n\nОтправь ссылку 🔥")
+
+    text = """
+🎬 <b>HoardVideoBot</b>
+
+━━━━━━━━━━━━━━━━━━
+
+📥 Скачиваю видео из:
+
+▸ YouTube & Shorts  
+▸ TikTok  
+▸ Instagram  
+▸ VK  
+▸ Twitter/X  
+▸ Pinterest  
+
+━━━━━━━━━━━━━━━━━━
+
+📎 Просто отправь ссылку 🔥
+"""
+
+    await message.answer(text, parse_mode="HTML")
 
 # ================= ADMIN =================
 
@@ -192,54 +197,17 @@ async def admin(message: Message):
 
     users = await get_users_count()
     total, rows = await get_download_stats()
-    channel = await get_setting("channel", "Не установлен")
-    sub_enabled = await get_setting("sub_enabled", "0")
 
     text = f"👥 Пользователи: {users}\n📥 Всего скачиваний: {total}\n\n"
     for r in rows:
         text += f"{r[0]} — {r[1]}\n"
 
-    text += f"\nКанал: {channel}\nПодписка: {'ВКЛ' if sub_enabled=='1' else 'ВЫКЛ'}"
+    await message.answer(text)
 
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔒 Переключить подписку", callback_data="toggle_sub")],
-        [InlineKeyboardButton(text="📢 Рассылка", callback_data="broadcast")]
-    ])
-
-    await message.answer(text, reply_markup=keyboard)
-
-# ================= CALLBACK =================
-
-@dp.callback_query(F.data == "toggle_sub")
-async def toggle_sub(callback: CallbackQuery):
-    current = await get_setting("sub_enabled", "0")
-    new = "0" if current == "1" else "1"
-    await set_setting("sub_enabled", new)
-    await callback.answer("Изменено ✅")
-    await callback.message.delete()
-
-@dp.callback_query(F.data == "broadcast")
-async def start_broadcast(callback: CallbackQuery):
-    broadcast_mode[callback.from_user.id] = True
-    await callback.message.answer("Отправь сообщение для рассылки")
-
-# ================= MESSAGE =================
+# ================= MAIN HANDLER =================
 
 @dp.message(F.text)
 async def handle(message: Message):
-
-    if message.from_user.id in broadcast_mode:
-        broadcast_mode.pop(message.from_user.id)
-        async with aiosqlite.connect(DB_MAIN) as db:
-            cur = await db.execute("SELECT id FROM users")
-            users = await cur.fetchall()
-        for u in users:
-            try:
-                await bot.send_message(u[0], message.text)
-            except:
-                pass
-        await message.answer("✅ Рассылка завершена")
-        return
 
     url = message.text.strip()
 
@@ -249,6 +217,9 @@ async def handle(message: Message):
     if not check_rate(message.from_user.id):
         await message.answer("⚠️ Слишком много запросов. Подожди минуту.")
         return
+
+    # Нормализуем YouTube
+    url = normalize_youtube(url)
 
     await message.answer("⏳ Загружаю...")
 
@@ -279,7 +250,7 @@ async def handle(message: Message):
 async def main():
     await init_db()
     os.makedirs(DOWNLOAD_PATH, exist_ok=True)
-    print("Bot 5.0 started")
+    print("Bot 6.0 started")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
