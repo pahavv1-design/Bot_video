@@ -1,7 +1,6 @@
 import asyncio
 import logging
 import os
-import uuid
 import subprocess
 import hashlib
 import time
@@ -27,114 +26,130 @@ dp = Dispatcher()
 
 queue = asyncio.Semaphore(3)
 
-CACHE_DB = "cache.db"
-LOG_DB = "logs.db"
-
-user_last_requests = {}
-user_temp_ban = {}
+DB_MAIN = "main.db"
+DB_LOG = "logs.db"
+SETTINGS = "settings.db"
 
 MAX_SIZE_MB = 60
-RATE_LIMIT_COUNT = 3
-RATE_LIMIT_WINDOW = 30
+RATE_LIMIT = 3
+RATE_WINDOW = 30
+
+user_requests = {}
+temp_ban = {}
+broadcast_mode = {}
 
 # ================= INIT =================
 
 async def init_db():
-    async with aiosqlite.connect(DB_NAME) as db:
+    async with aiosqlite.connect(DB_MAIN) as db:
         await db.execute("""
         CREATE TABLE IF NOT EXISTS users (
-            telegram_id INTEGER PRIMARY KEY,
+            id INTEGER PRIMARY KEY,
             joined_at TEXT
         )
         """)
         await db.commit()
 
-    async with aiosqlite.connect(LOG_DB) as db:
+    async with aiosqlite.connect(DB_LOG) as db:
         await db.execute("""
-        CREATE TABLE IF NOT EXISTS downloads_log (
-            user_id INTEGER,
+        CREATE TABLE IF NOT EXISTS downloads (
             platform TEXT,
-            file_size REAL,
             created_at TEXT
         )
         """)
         await db.commit()
 
+    async with aiosqlite.connect(SETTINGS) as db:
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+        """)
+        await db.commit()
+
+# ================= SETTINGS =================
+
+async def get_setting(key, default=None):
+    async with aiosqlite.connect(SETTINGS) as db:
+        cur = await db.execute("SELECT value FROM settings WHERE key=?", (key,))
+        row = await cur.fetchone()
+        return row[0] if row else default
+
+async def set_setting(key, value):
+    async with aiosqlite.connect(SETTINGS) as db:
+        await db.execute("INSERT OR REPLACE INTO settings VALUES (?, ?)", (key, value))
+        await db.commit()
+
 # ================= USERS =================
 
 async def add_user(user_id):
-    async with aiosqlite.connect(DB_NAME) as db:
+    async with aiosqlite.connect(DB_MAIN) as db:
         await db.execute("INSERT OR IGNORE INTO users VALUES (?, datetime('now'))", (user_id,))
         await db.commit()
 
-async def get_user_count():
-    async with aiosqlite.connect(DB_NAME) as db:
+async def get_users_count():
+    async with aiosqlite.connect(DB_MAIN) as db:
         cur = await db.execute("SELECT COUNT(*) FROM users")
         row = await cur.fetchone()
         return row[0]
 
 # ================= LOGS =================
 
-async def log_download(user_id, platform, size):
-    async with aiosqlite.connect(LOG_DB) as db:
-        await db.execute(
-            "INSERT INTO downloads_log VALUES (?, ?, ?, datetime('now'))",
-            (user_id, platform, size)
-        )
+async def log_download(platform):
+    async with aiosqlite.connect(DB_LOG) as db:
+        await db.execute("INSERT INTO downloads VALUES (?, datetime('now'))", (platform,))
         await db.commit()
 
-async def get_stats():
-    async with aiosqlite.connect(LOG_DB) as db:
-        cur = await db.execute("SELECT COUNT(*) FROM downloads_log")
+async def get_download_stats():
+    async with aiosqlite.connect(DB_LOG) as db:
+        cur = await db.execute("SELECT COUNT(*) FROM downloads")
         total = (await cur.fetchone())[0]
 
-        cur = await db.execute(
-            "SELECT platform, COUNT(*) FROM downloads_log GROUP BY platform"
-        )
-        platforms = await cur.fetchall()
+        cur = await db.execute("SELECT platform, COUNT(*) FROM downloads GROUP BY platform")
+        rows = await cur.fetchall()
 
-        return total, platforms
+        return total, rows
+
+# ================= RATE LIMIT =================
+
+def check_rate(user_id):
+    now = time.time()
+
+    if user_id in temp_ban:
+        if now < temp_ban[user_id]:
+            return False
+        else:
+            del temp_ban[user_id]
+
+    times = user_requests.get(user_id, [])
+    times = [t for t in times if now - t < RATE_WINDOW]
+    times.append(now)
+    user_requests[user_id] = times
+
+    if len(times) > RATE_LIMIT:
+        temp_ban[user_id] = now + 60
+        return False
+
+    return True
 
 # ================= PLATFORM =================
 
 def detect_platform(url):
-    url = url.lower()
-    if "youtube.com" in url or "youtu.be" in url:
+    u = url.lower()
+    if "youtube" in u or "youtu.be" in u:
         return "YouTube"
-    if "tiktok.com" in url:
+    if "tiktok" in u:
         return "TikTok"
-    if "instagram.com" in url:
+    if "instagram" in u:
         return "Instagram"
-    if "vk.com" in url:
+    if "vk.com" in u:
         return "VK"
-    if "twitter.com" in url or "x.com" in url:
+    if "twitter" in u or "x.com" in u:
         return "Twitter"
-    if "pinterest" in url:
+    if "pinterest" in u:
         return "Pinterest"
     return "Other"
-
-# ================= RATE LIMIT =================
-
-def check_rate_limit(user_id):
-    now = time.time()
-
-    if user_id in user_temp_ban:
-        if now < user_temp_ban[user_id]:
-            return False
-        else:
-            del user_temp_ban[user_id]
-
-    timestamps = user_last_requests.get(user_id, [])
-    timestamps = [t for t in timestamps if now - t < RATE_LIMIT_WINDOW]
-    timestamps.append(now)
-
-    user_last_requests[user_id] = timestamps
-
-    if len(timestamps) > RATE_LIMIT_COUNT:
-        user_temp_ban[user_id] = now + 60
-        return False
-
-    return True
 
 # ================= DOWNLOAD =================
 
@@ -142,21 +157,22 @@ def run_yt_dlp(url):
     filename = hashlib.md5(url.encode()).hexdigest()
     output = os.path.join(DOWNLOAD_PATH, filename)
 
+    subprocess.run(["yt-dlp", "-U"], stdout=subprocess.DEVNULL)
+
     command = [
         "yt-dlp",
-        "-f", "bv*+ba/b",
+        "-f", "bestvideo*+bestaudio/best",
         "--merge-output-format", "mp4",
         "--no-playlist",
-        "--concurrent-fragments", "5",
         "-o", f"{output}.%(ext)s",
         url
     ]
 
     subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-    for file in os.listdir(DOWNLOAD_PATH):
-        if file.startswith(filename):
-            return os.path.join(DOWNLOAD_PATH, file)
+    for f in os.listdir(DOWNLOAD_PATH):
+        if f.startswith(filename):
+            return os.path.join(DOWNLOAD_PATH, f)
 
     return None
 
@@ -165,7 +181,7 @@ def run_yt_dlp(url):
 @dp.message(Command("start"))
 async def start(message: Message):
     await add_user(message.from_user.id)
-    await message.answer("🎬 Hoard Video Bot\n\nОтправь ссылку 🔥")
+    await message.answer("🎬 HoardVideoBot\n\nОтправь ссылку 🔥")
 
 # ================= ADMIN =================
 
@@ -174,28 +190,64 @@ async def admin(message: Message):
     if message.from_user.id != ADMIN_ID:
         return
 
-    users = await get_user_count()
-    total, platforms = await get_stats()
+    users = await get_users_count()
+    total, rows = await get_download_stats()
+    channel = await get_setting("channel", "Не установлен")
+    sub_enabled = await get_setting("sub_enabled", "0")
 
-    text = f"👥 Пользователей: {users}\n📥 Всего скачиваний: {total}\n\n"
+    text = f"👥 Пользователи: {users}\n📥 Всего скачиваний: {total}\n\n"
+    for r in rows:
+        text += f"{r[0]} — {r[1]}\n"
 
-    for p in platforms:
-        text += f"{p[0]} — {p[1]}\n"
+    text += f"\nКанал: {channel}\nПодписка: {'ВКЛ' if sub_enabled=='1' else 'ВЫКЛ'}"
 
-    await message.answer(text)
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔒 Переключить подписку", callback_data="toggle_sub")],
+        [InlineKeyboardButton(text="📢 Рассылка", callback_data="broadcast")]
+    ])
 
-# ================= MAIN HANDLER =================
+    await message.answer(text, reply_markup=keyboard)
+
+# ================= CALLBACK =================
+
+@dp.callback_query(F.data == "toggle_sub")
+async def toggle_sub(callback: CallbackQuery):
+    current = await get_setting("sub_enabled", "0")
+    new = "0" if current == "1" else "1"
+    await set_setting("sub_enabled", new)
+    await callback.answer("Изменено ✅")
+    await callback.message.delete()
+
+@dp.callback_query(F.data == "broadcast")
+async def start_broadcast(callback: CallbackQuery):
+    broadcast_mode[callback.from_user.id] = True
+    await callback.message.answer("Отправь сообщение для рассылки")
+
+# ================= MESSAGE =================
 
 @dp.message(F.text)
 async def handle(message: Message):
+
+    if message.from_user.id in broadcast_mode:
+        broadcast_mode.pop(message.from_user.id)
+        async with aiosqlite.connect(DB_MAIN) as db:
+            cur = await db.execute("SELECT id FROM users")
+            users = await cur.fetchall()
+        for u in users:
+            try:
+                await bot.send_message(u[0], message.text)
+            except:
+                pass
+        await message.answer("✅ Рассылка завершена")
+        return
 
     url = message.text.strip()
 
     if not url.startswith("http"):
         return
 
-    if not check_rate_limit(message.from_user.id):
-        await message.answer("⚠️ Слишком много запросов. Подожди 1 минуту.")
+    if not check_rate(message.from_user.id):
+        await message.answer("⚠️ Слишком много запросов. Подожди минуту.")
         return
 
     await message.answer("⏳ Загружаю...")
@@ -211,19 +263,14 @@ async def handle(message: Message):
 
     if size_mb > MAX_SIZE_MB:
         os.remove(file_path)
-        await message.answer("❌ Видео больше 60 МБ. Слишком большое для отправки.")
+        await message.answer("❌ Видео больше 60 МБ")
         return
 
     platform = detect_platform(url)
-
-    await log_download(message.from_user.id, platform, size_mb)
+    await log_download(platform)
 
     file = FSInputFile(file_path)
-
-    await message.answer_video(
-        file,
-        caption="🎉 Скачано с помощью\n@HoardVideoBot"
-    )
+    await message.answer_video(file, caption="🎉 @HoardVideoBot")
 
     os.remove(file_path)
 
@@ -232,7 +279,7 @@ async def handle(message: Message):
 async def main():
     await init_db()
     os.makedirs(DOWNLOAD_PATH, exist_ok=True)
-    print("Bot 4.0 started")
+    print("Bot 5.0 started")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
