@@ -8,13 +8,7 @@ import re
 
 import aiosqlite
 from aiogram import Bot, Dispatcher, F
-from aiogram.types import (
-    Message,
-    InlineKeyboardMarkup,
-    InlineKeyboardButton,
-    CallbackQuery,
-    FSInputFile
-)
+from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, FSInputFile
 from aiogram.filters import Command
 
 from config import *
@@ -154,6 +148,7 @@ def run_yt_dlp(url, audio=False):
             "-x",
             "--audio-format", "mp3",
             "--no-playlist",
+            "--no-check-certificate",
             "-o", f"{output}.%(ext)s",
             url
         ]
@@ -163,6 +158,7 @@ def run_yt_dlp(url, audio=False):
             "-f", "bestvideo*+bestaudio/best",
             "--merge-output-format", "mp4",
             "--no-playlist",
+            "--no-check-certificate",
             "-o", f"{output}.%(ext)s",
             url
         ]
@@ -186,7 +182,7 @@ async def start(message: Message):
 
 ━━━━━━━━━━━━━━━━━━
 
-📥 Скачиваю видео из:
+📥 Поддержка:
 
 ▸ YouTube & Shorts  
 ▸ TikTok  
@@ -289,7 +285,7 @@ async def process(callback: CallbackQuery):
 async def main():
     await init_db()
     os.makedirs(DOWNLOAD_PATH, exist_ok=True)
-    print("Bot 7.0 started")
+    print("Bot 8.0 started")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
