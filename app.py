@@ -8,7 +8,13 @@ import re
 
 import aiosqlite
 from aiogram import Bot, Dispatcher, F
-from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, FSInputFile
+from aiogram.types import (
+    Message,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+    CallbackQuery,
+    FSInputFile
+)
 from aiogram.filters import Command
 
 from config import *
@@ -22,6 +28,7 @@ queue = asyncio.Semaphore(3)
 
 DB_MAIN = "main.db"
 DB_LOG = "logs.db"
+DB_SETTINGS = "settings.db"
 
 MAX_SIZE_MB = 60
 RATE_LIMIT = 3
@@ -30,6 +37,8 @@ RATE_WINDOW = 30
 user_requests = {}
 temp_ban = {}
 user_links = {}
+broadcast_mode = {}
+set_channel_mode = {}
 
 # ================= INIT =================
 
@@ -51,6 +60,28 @@ async def init_db():
         )
         """)
         await db.commit()
+
+    async with aiosqlite.connect(DB_SETTINGS) as db:
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+        """)
+        await db.commit()
+
+# ================= SETTINGS =================
+
+async def set_setting(key, value):
+    async with aiosqlite.connect(DB_SETTINGS) as db:
+        await db.execute("INSERT OR REPLACE INTO settings VALUES (?, ?)", (key, value))
+        await db.commit()
+
+async def get_setting(key):
+    async with aiosqlite.connect(DB_SETTINGS) as db:
+        cur = await db.execute("SELECT value FROM settings WHERE key=?", (key,))
+        row = await cur.fetchone()
+        return row[0] if row else None
 
 # ================= USERS =================
 
@@ -109,7 +140,7 @@ def check_rate(user_id):
 def detect_platform(url):
     u = url.lower()
 
-    if "youtube" in u or "youtu.be" in u:
+    if "youtube" in u:
         return "YouTube"
     if "tiktok" in u:
         return "TikTok"
@@ -124,16 +155,14 @@ def detect_platform(url):
 
     return "Other"
 
-# ================= YOUTUBE NORMALIZATION =================
+# ================= NORMALIZE YOUTUBE =================
 
 def normalize_youtube(url):
     url = url.split("?")[0]
-
     match = re.search(r"/shorts/([a-zA-Z0-9_-]+)", url)
     if match:
         video_id = match.group(1)
         return f"https://www.youtube.com/watch?v={video_id}"
-
     return url
 
 # ================= DOWNLOAD =================
@@ -148,7 +177,6 @@ def run_yt_dlp(url, audio=False):
             "-x",
             "--audio-format", "mp3",
             "--no-playlist",
-            "--no-check-certificate",
             "-o", f"{output}.%(ext)s",
             url
         ]
@@ -158,7 +186,6 @@ def run_yt_dlp(url, audio=False):
             "-f", "bestvideo*+bestaudio/best",
             "--merge-output-format", "mp4",
             "--no-playlist",
-            "--no-check-certificate",
             "-o", f"{output}.%(ext)s",
             url
         ]
@@ -181,16 +208,12 @@ async def start(message: Message):
 🎬 <b>HoardVideoBot</b>
 
 ━━━━━━━━━━━━━━━━━━
-
-📥 Поддержка:
-
-▸ YouTube & Shorts  
-▸ TikTok  
-▸ Instagram  
-▸ VK  
-▸ Twitter/X  
-▸ Pinterest  
-
+📥 YouTube & Shorts
+📥 TikTok
+📥 Instagram
+📥 VK
+📥 Twitter/X
+📥 Pinterest
 ━━━━━━━━━━━━━━━━━━
 
 📎 Отправь ссылку 🔥
@@ -198,13 +221,23 @@ async def start(message: Message):
 
     await message.answer(text, parse_mode="HTML")
 
-# ================= ADMIN =================
+# ================= ADMIN PANEL =================
 
 @dp.message(Command("admin"))
 async def admin(message: Message):
     if message.from_user.id != ADMIN_ID:
         return
 
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📊 Статистика", callback_data="stats")],
+        [InlineKeyboardButton(text="📢 Рассылка", callback_data="broadcast")],
+        [InlineKeyboardButton(text="➕ Установить канал", callback_data="set_channel")]
+    ])
+
+    await message.answer("👑 Админ панель", reply_markup=keyboard)
+
+@dp.callback_query(F.data == "stats")
+async def stats(callback: CallbackQuery):
     users = await get_users_count()
     total, rows = await get_download_stats()
 
@@ -212,12 +245,43 @@ async def admin(message: Message):
     for r in rows:
         text += f"{r[0]} — {r[1]}\n"
 
-    await message.answer(text)
+    await callback.message.answer(text)
+
+@dp.callback_query(F.data == "broadcast")
+async def start_broadcast(callback: CallbackQuery):
+    broadcast_mode[callback.from_user.id] = True
+    await callback.message.answer("Отправь текст для рассылки")
+
+@dp.callback_query(F.data == "set_channel")
+async def set_channel(callback: CallbackQuery):
+    set_channel_mode[callback.from_user.id] = True
+    await callback.message.answer("Отправь @username канала")
 
 # ================= MESSAGE =================
 
 @dp.message(F.text)
 async def handle(message: Message):
+
+    # Установка канала
+    if message.from_user.id in set_channel_mode:
+        await set_setting("channel", message.text.strip())
+        set_channel_mode.pop(message.from_user.id)
+        await message.answer("✅ Канал сохранён")
+        return
+
+    # Рассылка
+    if message.from_user.id in broadcast_mode:
+        broadcast_mode.pop(message.from_user.id)
+        async with aiosqlite.connect(DB_MAIN) as db:
+            cur = await db.execute("SELECT id FROM users")
+            users = await cur.fetchall()
+        for u in users:
+            try:
+                await bot.send_message(u[0], message.text)
+            except:
+                pass
+        await message.answer("✅ Рассылка завершена")
+        return
 
     url = message.text.strip()
 
@@ -225,18 +289,15 @@ async def handle(message: Message):
         return
 
     if not check_rate(message.from_user.id):
-        await message.answer("⚠️ Слишком много запросов. Подожди минуту.")
+        await message.answer("⚠️ Слишком много запросов.")
         return
 
     url = normalize_youtube(url)
-
     user_links[message.from_user.id] = url
 
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="🎥 Видео", callback_data="video"),
-            InlineKeyboardButton(text="🎵 Музыка", callback_data="audio")
-        ]
+        [InlineKeyboardButton(text="🎥 Видео", callback_data="video"),
+         InlineKeyboardButton(text="🎵 Музыка", callback_data="audio")]
     ])
 
     await message.answer("Выбери формат:", reply_markup=keyboard)
@@ -248,24 +309,22 @@ async def process(callback: CallbackQuery):
 
     url = user_links.get(callback.from_user.id)
     if not url:
-        await callback.answer("Ошибка")
         return
 
-    await callback.answer("⏳ Обработка...")
-    await callback.message.answer("⏳ Загружаю...")
+    loading = await callback.message.answer("⏳ Загружаю...")
 
     async with queue:
         file_path = run_yt_dlp(url, audio=(callback.data == "audio"))
 
     if not file_path:
-        await callback.message.answer("❌ Ссылка не поддерживается или нерабочая")
+        await loading.edit_text("❌ Ссылка не поддерживается")
         return
 
     size_mb = os.path.getsize(file_path) / (1024 * 1024)
 
     if size_mb > MAX_SIZE_MB:
         os.remove(file_path)
-        await callback.message.answer("❌ Видео больше 60 МБ")
+        await loading.edit_text("❌ Видео больше 60 МБ")
         return
 
     platform = detect_platform(url)
@@ -279,13 +338,14 @@ async def process(callback: CallbackQuery):
         await callback.message.answer_audio(file, caption="🎉 @HoardVideoBot")
 
     os.remove(file_path)
+    await loading.delete()
 
 # ================= MAIN =================
 
 async def main():
     await init_db()
     os.makedirs(DOWNLOAD_PATH, exist_ok=True)
-    print("Bot 8.0 started")
+    print("Bot stable version started")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
