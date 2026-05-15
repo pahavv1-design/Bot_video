@@ -172,10 +172,10 @@ async def start(message: Message):
 ━━━━━━━━━━━━━━━━━━
 📥 YouTube & Shorts
 📥 TikTok
-📥 Instagram
+📥 Instagram ( фото и видео) 
 📥 VK
 📥 Twitter/X
-📥 Pinterest
+📥 Pinterest ( видео) 
 ━━━━━━━━━━━━━━━━━━
 
 📎 Отправь ссылку 🔥
