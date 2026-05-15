@@ -7,7 +7,13 @@ import time
 import re
 import aiosqlite
 from aiogram import Bot, Dispatcher, F
-from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, FSInputFile
+from aiogram.types import (
+    Message,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+    CallbackQuery,
+    FSInputFile
+)
 from aiogram.filters import Command
 from config import *
 
@@ -20,6 +26,7 @@ queue = asyncio.Semaphore(3)
 
 DB_MAIN = "main.db"
 DB_LOG = "logs.db"
+DB_SETTINGS = "settings.db"
 
 MAX_SIZE_MB = 60
 RATE_LIMIT = 3
@@ -28,12 +35,19 @@ RATE_WINDOW = 30
 user_requests = {}
 temp_ban = {}
 user_links = {}
+broadcast_mode = {}
+set_channel_mode = {}
 
 # ================= INIT =================
 
 async def init_db():
     async with aiosqlite.connect(DB_MAIN) as db:
-        await db.execute("CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY)")
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY,
+            joined_at TEXT
+        )
+        """)
         await db.commit()
 
     async with aiosqlite.connect(DB_LOG) as db:
@@ -45,17 +59,85 @@ async def init_db():
         """)
         await db.commit()
 
+    async with aiosqlite.connect(DB_SETTINGS) as db:
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+        """)
+        await db.commit()
+
+# ================= SETTINGS =================
+
+async def set_setting(key, value):
+    async with aiosqlite.connect(DB_SETTINGS) as db:
+        await db.execute("INSERT OR REPLACE INTO settings VALUES (?, ?)", (key, value))
+        await db.commit()
+
+async def get_setting(key):
+    async with aiosqlite.connect(DB_SETTINGS) as db:
+        cur = await db.execute("SELECT value FROM settings WHERE key=?", (key,))
+        row = await cur.fetchone()
+        return row[0] if row else None
+
 # ================= USERS =================
 
 async def add_user(user_id):
     async with aiosqlite.connect(DB_MAIN) as db:
-        await db.execute("INSERT OR IGNORE INTO users VALUES (?)", (user_id,))
+        await db.execute("INSERT OR IGNORE INTO users VALUES (?, datetime('now'))", (user_id,))
         await db.commit()
+
+async def get_users_count():
+    async with aiosqlite.connect(DB_MAIN) as db:
+        cur = await db.execute("SELECT COUNT(*) FROM users")
+        row = await cur.fetchone()
+        return row[0]
+
+# ================= LOGS =================
+
+async def log_download(platform):
+    async with aiosqlite.connect(DB_LOG) as db:
+        await db.execute("INSERT INTO downloads VALUES (?, datetime('now'))", (platform,))
+        await db.commit()
+
+async def get_download_stats():
+    async with aiosqlite.connect(DB_LOG) as db:
+        cur = await db.execute("SELECT COUNT(*) FROM downloads")
+        total = (await cur.fetchone())[0]
+
+        cur = await db.execute("SELECT platform, COUNT(*) FROM downloads GROUP BY platform")
+        rows = await cur.fetchall()
+
+        return total, rows
+
+# ================= RATE LIMIT =================
+
+def check_rate(user_id):
+    now = time.time()
+
+    if user_id in temp_ban:
+        if now < temp_ban[user_id]:
+            return False
+        else:
+            del temp_ban[user_id]
+
+    times = user_requests.get(user_id, [])
+    times = [t for t in times if now - t < RATE_WINDOW]
+    times.append(now)
+    user_requests[user_id] = times
+
+    if len(times) > RATE_LIMIT:
+        temp_ban[user_id] = now + 60
+        return False
+
+    return True
 
 # ================= PLATFORM =================
 
 def detect_platform(url):
     u = url.lower()
+
     if "youtube" in u:
         return "YouTube"
     if "tiktok" in u:
@@ -68,6 +150,7 @@ def detect_platform(url):
         return "Twitter"
     if "pinterest" in u or "pin.it" in u:
         return "Pinterest"
+
     return "Other"
 
 # ================= NORMALIZE YOUTUBE =================
@@ -82,7 +165,7 @@ def normalize_youtube(url):
 
 # ================= DOWNLOAD =================
 
-def run_yt_dlp(url, audio=False):
+def run_yt_dlp(url, platform, audio=False):
     filename = hashlib.md5(url.encode()).hexdigest()
     output = os.path.join(DOWNLOAD_PATH, filename)
 
@@ -96,9 +179,15 @@ def run_yt_dlp(url, audio=False):
             url
         ]
     else:
+        # Instagram требует best
+        if platform == "Instagram":
+            fmt = "best"
+        else:
+            fmt = "bestvideo+bestaudio/best"
+
         command = [
             "yt-dlp",
-            "-f", "bestvideo+bestaudio/best",
+            "-f", fmt,
             "--merge-output-format", "mp4",
             "--no-playlist",
             "-o", f"{output}.%(ext)s",
@@ -123,15 +212,12 @@ async def start(message: Message):
 🎬 <b>HoardVideoBot</b>
 
 ━━━━━━━━━━━━━━━━━━
-📥 Поддержка:
-
-▸ YouTube & Shorts  
-▸ TikTok  
-▸ Instagram (фото + видео)  
-▸ VK  
-▸ Twitter/X  
-▸ Pinterest  
-
+📥 YouTube & Shorts
+📥 TikTok
+📥 Instagram
+📥 VK
+📥 Twitter/X
+📥 Pinterest
 ━━━━━━━━━━━━━━━━━━
 
 📎 Отправь ссылку —
@@ -140,32 +226,65 @@ async def start(message: Message):
 
     await message.answer(text, parse_mode="HTML")
 
-# ================= RATE LIMIT =================
+# ================= ADMIN =================
 
-def check_rate(user_id):
-    now = time.time()
+@dp.message(Command("admin"))
+async def admin(message: Message):
+    if message.from_user.id != ADMIN_ID:
+        return
 
-    if user_id in temp_ban:
-        if now < temp_ban[user_id]:
-            return False
-        else:
-            del temp_ban[user_id]
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📊 Статистика", callback_data="stats")],
+        [InlineKeyboardButton(text="📢 Рассылка", callback_data="broadcast")],
+        [InlineKeyboardButton(text="➕ Установить канал", callback_data="set_channel")]
+    ])
 
-    times = user_requests.get(user_id, [])
-    times = [t for t in times if now - t < RATE_WINDOW]
-    times.append(now)
-    user_requests[user_id] = times
+    await message.answer("👑 Админ панель", reply_markup=keyboard)
 
-    if len(times) > RATE_LIMIT:
-        temp_ban[user_id] = now + 60
-        return False
+@dp.callback_query(F.data == "stats")
+async def stats(callback: CallbackQuery):
+    users = await get_users_count()
+    total, rows = await get_download_stats()
 
-    return True
+    text = f"👥 Пользователи: {users}\n📥 Всего скачиваний: {total}\n\n"
+    for r in rows:
+        text += f"{r[0]} — {r[1]}\n"
+
+    await callback.message.answer(text)
+
+@dp.callback_query(F.data == "broadcast")
+async def start_broadcast(callback: CallbackQuery):
+    broadcast_mode[callback.from_user.id] = True
+    await callback.message.answer("Отправь текст для рассылки")
+
+@dp.callback_query(F.data == "set_channel")
+async def set_channel(callback: CallbackQuery):
+    set_channel_mode[callback.from_user.id] = True
+    await callback.message.answer("Отправь @username канала")
 
 # ================= MESSAGE =================
 
 @dp.message(F.text)
 async def handle(message: Message):
+
+    if message.from_user.id in set_channel_mode:
+        await set_setting("channel", message.text.strip())
+        set_channel_mode.pop(message.from_user.id)
+        await message.answer("✅ Канал сохранён")
+        return
+
+    if message.from_user.id in broadcast_mode:
+        broadcast_mode.pop(message.from_user.id)
+        async with aiosqlite.connect(DB_MAIN) as db:
+            cur = await db.execute("SELECT id FROM users")
+            users = await cur.fetchall()
+        for u in users:
+            try:
+                await bot.send_message(u[0], message.text)
+            except:
+                pass
+        await message.answer("✅ Рассылка завершена")
+        return
 
     url = message.text.strip()
     if not url.startswith("http"):
@@ -180,21 +299,16 @@ async def handle(message: Message):
 
     platform = detect_platform(url)
 
-    # Фото только для Instagram
     if platform == "Instagram":
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [
-                InlineKeyboardButton(text="🎥 Видео", callback_data="video"),
-                InlineKeyboardButton(text="🎵 Музыка", callback_data="audio"),
-                InlineKeyboardButton(text="🖼 Фото", callback_data="photo")
-            ]
+            [InlineKeyboardButton(text="🎥 Видео", callback_data="video"),
+             InlineKeyboardButton(text="🎵 Музыка", callback_data="audio"),
+             InlineKeyboardButton(text="🖼 Фото", callback_data="photo")]
         ])
     else:
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [
-                InlineKeyboardButton(text="🎥 Видео", callback_data="video"),
-                InlineKeyboardButton(text="🎵 Музыка", callback_data="audio")
-            ]
+            [InlineKeyboardButton(text="🎥 Видео", callback_data="video"),
+             InlineKeyboardButton(text="🎵 Музыка", callback_data="audio")]
         ])
 
     await message.answer("Выбери формат:", reply_markup=keyboard)
@@ -208,10 +322,12 @@ async def process(callback: CallbackQuery):
     if not url:
         return
 
+    platform = detect_platform(url)
+
     loading = await callback.message.answer("⏳ Загружаю...")
 
     async with queue:
-        file_path = run_yt_dlp(url, audio=(callback.data == "audio"))
+        file_path = run_yt_dlp(url, platform, audio=(callback.data == "audio"))
 
     if not file_path:
         await loading.edit_text("❌ Ссылка не поддерживается или нерабочая")
@@ -222,6 +338,8 @@ async def process(callback: CallbackQuery):
         os.remove(file_path)
         await loading.edit_text("❌ Файл больше 60 МБ")
         return
+
+    await log_download(platform)
 
     file = FSInputFile(file_path)
 
@@ -240,7 +358,7 @@ async def process(callback: CallbackQuery):
 async def main():
     await init_db()
     os.makedirs(DOWNLOAD_PATH, exist_ok=True)
-    print("Bot stable fixed version started")
+    print("Bot fixed Instagram version started")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
