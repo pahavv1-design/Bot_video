@@ -7,7 +7,13 @@ import time
 import re
 import aiosqlite
 from aiogram import Bot, Dispatcher, F
-from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, FSInputFile
+from aiogram.types import (
+    Message,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+    CallbackQuery,
+    FSInputFile
+)
 from aiogram.filters import Command
 from config import *
 
@@ -20,7 +26,6 @@ queue = asyncio.Semaphore(3)
 
 DB_MAIN = "main.db"
 DB_LOG = "logs.db"
-DB_SETTINGS = "settings.db"
 
 MAX_SIZE_MB = 60
 RATE_LIMIT = 3
@@ -29,6 +34,7 @@ RATE_WINDOW = 30
 user_requests = {}
 temp_ban = {}
 user_links = {}
+broadcast_mode = {}
 set_channel_mode = {}
 
 # ================= INIT =================
@@ -43,15 +49,6 @@ async def init_db():
         CREATE TABLE IF NOT EXISTS downloads (
             platform TEXT,
             created_at TEXT
-        )
-        """)
-        await db.commit()
-
-    async with aiosqlite.connect(DB_SETTINGS) as db:
-        await db.execute("""
-        CREATE TABLE IF NOT EXISTS settings (
-            key TEXT PRIMARY KEY,
-            value TEXT
         )
         """)
         await db.commit()
@@ -78,19 +75,6 @@ def check_rate(user_id):
 
     return True
 
-# ================= SETTINGS =================
-
-async def set_setting(key, value):
-    async with aiosqlite.connect(DB_SETTINGS) as db:
-        await db.execute("INSERT OR REPLACE INTO settings VALUES (?, ?)", (key, value))
-        await db.commit()
-
-async def get_setting(key):
-    async with aiosqlite.connect(DB_SETTINGS) as db:
-        cur = await db.execute("SELECT value FROM settings WHERE key=?", (key,))
-        row = await cur.fetchone()
-        return row[0] if row else None
-
 # ================= USERS =================
 
 async def add_user(user_id):
@@ -111,18 +95,15 @@ async def log_download(platform):
         await db.execute("INSERT INTO downloads VALUES (?, datetime('now'))", (platform,))
         await db.commit()
 
-# ================= SUBSCRIPTION =================
+async def get_download_stats():
+    async with aiosqlite.connect(DB_LOG) as db:
+        cur = await db.execute("SELECT COUNT(*) FROM downloads")
+        total = (await cur.fetchone())[0]
 
-async def check_subscription(user_id):
-    channel = await get_setting("channel")
-    if not channel:
-        return True
+        cur = await db.execute("SELECT platform, COUNT(*) FROM downloads GROUP BY platform")
+        rows = await cur.fetchall()
 
-    try:
-        member = await bot.get_chat_member(channel, user_id)
-        return member.status in ["member", "administrator", "creator"]
-    except:
-        return False
+        return total, rows
 
 # ================= PLATFORM =================
 
@@ -142,46 +123,36 @@ def detect_platform(url):
         return "Pinterest"
     return "Other"
 
-# ================= NORMALIZE YOUTUBE =================
-
-def normalize_youtube(url):
-    url = url.split("?")[0]
-    match = re.search(r"/shorts/([a-zA-Z0-9_-]+)", url)
-    if match:
-        video_id = match.group(1)
-        return f"https://www.youtube.com/watch?v={video_id}"
-    return url
-
 # ================= DOWNLOAD =================
 
-def run_yt_dlp(url, platform, audio=False):
+def run_yt_dlp(url, audio=False):
     filename = hashlib.md5(url.encode()).hexdigest()
     output = os.path.join(DOWNLOAD_PATH, filename)
 
-    base_command = [
-        "yt-dlp",
-        "--no-playlist",
-        "--add-header", "User-Agent: Mozilla/5.0",
-        "-o", f"{output}.%(ext)s",
-        url
-    ]
+    # Instagram через mobile extractor
+    if "instagram.com" in url:
+        base = [
+            "yt-dlp",
+            "--user-agent", "Mozilla/5.0 (iPhone; CPU iPhone OS 15_0 like Mac OS X)",
+            "-o", f"{output}.%(ext)s",
+            url
+        ]
+    else:
+        base = [
+            "yt-dlp",
+            "-f", "bestvideo+bestaudio/best",
+            "--merge-output-format", "mp4",
+            "--no-playlist",
+            "-o", f"{output}.%(ext)s",
+            url
+        ]
 
     if audio:
-        command = base_command[:]
-        command.insert(1, "-x")
-        command.insert(2, "--audio-format")
-        command.insert(3, "mp3")
-    else:
-        if platform == "Instagram":
-            command = base_command[:]  # для Instagram best
-        else:
-            command = base_command[:]
-            command.insert(1, "-f")
-            command.insert(2, "bestvideo+bestaudio/best")
-            command.insert(3, "--merge-output-format")
-            command.insert(4, "mp4")
+        base.insert(1, "-x")
+        base.insert(2, "--audio-format")
+        base.insert(3, "mp3")
 
-    subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    subprocess.run(base, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     for f in os.listdir(DOWNLOAD_PATH):
         if f.startswith(filename):
@@ -195,23 +166,20 @@ def run_yt_dlp(url, platform, audio=False):
 async def start(message: Message):
     await add_user(message.from_user.id)
 
-    text = """
+    await message.answer("""
 🎬 <b>HoardVideoBot</b>
 
 ━━━━━━━━━━━━━━━━━━
 📥 YouTube & Shorts
 📥 TikTok
-📥 Instagram ( фото + видео) 
+📥 Instagram
 📥 VK
 📥 Twitter/X
 📥 Pinterest
 ━━━━━━━━━━━━━━━━━━
 
-📎 Отправь ссылку —
-я подготовлю файл ⚡
-"""
-
-    await message.answer(text, parse_mode="HTML")
+📎 Отправь ссылку 🔥
+""", parse_mode="HTML")
 
 # ================= ADMIN =================
 
@@ -222,39 +190,57 @@ async def admin(message: Message):
 
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📊 Статистика", callback_data="stats")],
-        [InlineKeyboardButton(text="➕ Установить канал", callback_data="set_channel")]
+        [InlineKeyboardButton(text="📢 Рассылка", callback_data="broadcast")]
     ])
 
     await message.answer("👑 Админ панель", reply_markup=keyboard)
+
+@dp.callback_query(F.data == "stats")
+async def stats(callback: CallbackQuery):
+    users = await get_users_count()
+    total, rows = await get_download_stats()
+
+    text = f"👥 Пользователи: {users}\n📥 Всего скачиваний: {total}\n\n"
+    for r in rows:
+        text += f"{r[0]} — {r[1]}\n"
+
+    await callback.message.answer(text)
+
+@dp.callback_query(F.data == "broadcast")
+async def start_broadcast(callback: CallbackQuery):
+    broadcast_mode[callback.from_user.id] = True
+    await callback.message.answer("Отправь текст для рассылки")
 
 # ================= MESSAGE =================
 
 @dp.message(F.text)
 async def handle(message: Message):
 
-    if message.from_user.id in set_channel_mode:
-        await set_setting("channel", message.text.strip())
-        set_channel_mode.pop(message.from_user.id)
-        await message.answer("✅ Канал сохранён")
-        return
+    if message.from_user.id in broadcast_mode:
+        broadcast_mode.pop(message.from_user.id)
 
-    if not check_rate(message.from_user.id):
-        await message.answer("⚠️ Слишком много запросов. Подожди минуту.")
-        return
+        async with aiosqlite.connect(DB_MAIN) as db:
+            cur = await db.execute("SELECT id FROM users")
+            users = await cur.fetchall()
 
-    if not await check_subscription(message.from_user.id):
-        channel = await get_setting("channel")
-        keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="Подписаться", url=f"https://t.me/{channel.replace('@','')}")]
-        ])
-        await message.answer("❗ Подпишись на канал для использования бота", reply_markup=keyboard)
+        for u in users:
+            try:
+                await bot.send_message(u[0], message.text)
+            except:
+                pass
+
+        await message.answer("✅ Рассылка завершена")
         return
 
     url = message.text.strip()
+
     if not url.startswith("http"):
         return
 
-    url = normalize_youtube(url)
+    if not check_rate(message.from_user.id):
+        await message.answer("⚠️ Слишком много запросов.")
+        return
+
     user_links[message.from_user.id] = url
 
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
@@ -278,7 +264,7 @@ async def process(callback: CallbackQuery):
     loading = await callback.message.answer("⏳ Загружаю...")
 
     async with queue:
-        file_path = run_yt_dlp(url, platform, audio=(callback.data == "audio"))
+        file_path = run_yt_dlp(url, audio=(callback.data == "audio"))
 
     if not file_path:
         await loading.edit_text("❌ Ссылка не поддерживается или нерабочая")
@@ -307,7 +293,7 @@ async def process(callback: CallbackQuery):
 async def main():
     await init_db()
     os.makedirs(DOWNLOAD_PATH, exist_ok=True)
-    print("Bot stable version with rate limit")
+    print("Bot Instagram fixed version")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
